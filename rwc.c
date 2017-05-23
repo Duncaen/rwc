@@ -159,8 +159,7 @@ static void
 watch(char *file, int report)
 {
 	struct kevent ev;
-        struct stat st;
-	int fd, flags;
+	int fd;
 	char *key;
 
 	key = strdup(file);
@@ -183,17 +182,13 @@ watch(char *file, int report)
 	}
 
 watchfile:
-	flags = NOTE_WRITE | NOTE_RENAME | NOTE_TRUNCATE | NOTE_DELETE;
-	if (!lstat(file, &st) && S_ISDIR(st.st_mode))
-		flags |= NOTE_EXTEND;
-
 	fd = open(file, O_RDONLY | O_NONBLOCK);
 	if (fd < 0) {
 		fprintf(stderr, "%s: open: %s: %s\n",
 			argv0, file, strerror(errno));
 	} else {
 		EV_SET(&ev, fd, EVFILT_VNODE, EV_ADD | EV_CLEAR | EV_ENABLE,
-		    flags, 0, file);
+		    NOTE_DELETE | NOTE_RENAME | NOTE_TRUNCATE | NOTE_WRITE, 0, file);
 		if (kevent(ifd, &ev, 1, 0, 0, 0) < 0)
 			fprintf(stderr, "%s: kevent: %s: %s\n",
 				argv0, file, strerror(errno));
@@ -228,11 +223,11 @@ add(char *file)
 {
         struct stat st;
 
-	watch(file, 1);
+	watch(file, 0);
 
 	if (!lstat(file, &st) && S_ISDIR(st.st_mode)) {
 		tsearch(file, &root, order);
-		scan(file, 1);
+		scan(file, 0);
 	}
 }
 
