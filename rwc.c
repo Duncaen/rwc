@@ -30,6 +30,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#ifndef __linux__
+#include <dirent.h>
+#endif
 
 char *argv0;
 char ibuf[8192];
@@ -149,57 +152,114 @@ run(void)
 	}
 }
 #else
+
+static void *files = 0; // tree
+
 static void
-add(char *file)
+watch(char *file, int report)
 {
 	struct kevent ev;
         struct stat st;
-	int wd;
+	int fd, flags;
 	char *key;
 
 	key = strdup(file);
-
-	// check if the file is already registered
-	if (tfind(key, &root, order))
+	if (!key)
 		return;
 
-	// assume non-existing files are regular files
-	if (lstat(file, &st) && S_ISDIR(st.st_mode)) {
-		//
+	// check if the file is already registered
+	if (tfind(key, &files, order))
+		return;
+
+	if (report) {
+		if (pflag) {
+			int n;
+			ioctl(1, FIONREAD, &n);
+			if (n > 0)
+				goto watchfile;
+		}
+		printf("%s%c", file, input_delim);
+		fflush(stdout);
 	}
 
-	wd = open(file, O_RDONLY | O_NONBLOCK);
-	if (wd < 0) {
+watchfile:
+	flags = NOTE_WRITE | NOTE_RENAME | NOTE_TRUNCATE | NOTE_DELETE;
+	if (!lstat(file, &st) && S_ISDIR(st.st_mode))
+		flags |= NOTE_EXTEND;
+
+	fd = open(file, O_RDONLY | O_NONBLOCK);
+	if (fd < 0) {
 		fprintf(stderr, "%s: open: %s: %s\n",
 			argv0, file, strerror(errno));
 	} else {
-		// (S_ISDIR(st.st_mode) ? NOTE_EXTEND : 0) | NOTE_WRITE | NOTE_ATTRIB | NOTE_RENAME | NOTE_TRUNCATE | (dflag ? NOTE_DELETE : 0),
-		EV_SET(&ev, wd, EVFILT_VNODE, EV_ADD | EV_ENABLE | EV_CLEAR,
-		    NOTE_WRITE | NOTE_ATTRIB | NOTE_RENAME | (dflag ? NOTE_DELETE : 0),
-		    0, file);
-	if (kevent(ifd, &ev, 1, 0, 0, 0) < 0)
-		fprintf(stderr, "%s: kevent: %s: %s\n",
-			argv0, file, strerror(errno));
-	tsearch(key, &root, order);
+		EV_SET(&ev, fd, EVFILT_VNODE, EV_ADD | EV_CLEAR | EV_ENABLE,
+		    flags, 0, file);
+		if (kevent(ifd, &ev, 1, 0, 0, 0) < 0)
+			fprintf(stderr, "%s: kevent: %s: %s\n",
+				argv0, file, strerror(errno));
+		tsearch(key, &files, order);
+	}
 }
+
+static void
+scan(char *file, int report)
+{
+	char fullpath[PATH_MAX];
+	struct dirent *dp;
+	DIR *dir;
+
+	if (!(dir = opendir(file)))
+		return;
+
+	while ((dp = readdir(dir)) != 0) {
+		if ((dp->d_namlen == 1 && dp->d_name[0] == '.') ||
+		    (dp->d_namlen == 2 && dp->d_name[0] == '.' &&
+		    dp->d_name[1] == '.'))
+			continue;
+		snprintf(fullpath, sizeof fullpath, "%s/%s", file, dp->d_name);
+		watch(strdup(fullpath), report);
+	}
+
+	closedir(dir);
+}
+
+static void
+add(char *file)
+{
+        struct stat st;
+
+	watch(file, 1);
+
+	if (!lstat(file, &st) && S_ISDIR(st.st_mode)) {
+		tsearch(file, &root, order);
+		scan(file, 1);
+	}
 }
 
 static void
 run(void)
 {
-struct kevent eventlist[5];
-struct kevent *ev;
-int len, i;
+	struct kevent eventlist[5];
+	struct kevent *ev;
+	int len, i;
 
-while (1) {
-	len = kevent(ifd, 0, 0, eventlist, 5, 0);
-	for (i = 0; i < len; i++) {
-		ev = &eventlist[i];
-		if (ev->flags & EV_ERROR) {
-			fprintf(stderr, "EV_ERROR\n");
-			exit(111);
-		}
-
+	while (1) {
+		len = kevent(ifd, 0, 0, eventlist, 5, 0);
+		for (i = 0; i < len; i++) {
+			ev = &eventlist[i];
+			if (ev->flags & EV_ERROR) {
+				fprintf(stderr, "EV_ERROR\n");
+				exit(111);
+			}
+			if (ev->fflags & (NOTE_DELETE | NOTE_RENAME)) {
+				tdelete(ev->udata, &files, order);
+				close(ev->ident);
+				if (ev->fflags & NOTE_RENAME)
+					continue;
+			} else if (tfind(ev->udata, &root, order)) {
+				scan(ev->udata, 1);
+				continue;
+			}
 			if (pflag) {
 				int n;
 				ioctl(1, FIONREAD, &n);
@@ -207,7 +267,7 @@ while (1) {
 					break;
 			}
 			printf("%s%s%c",
-			    (ev->fflags & NOTE_DELETE ? "- " : ""),
+			    (dflag && ev->fflags & NOTE_DELETE ? "- " : ""),
 			    (char *)ev->udata,
 			    input_delim);
 			fflush(stdout);
